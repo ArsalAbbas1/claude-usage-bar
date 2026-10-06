@@ -20,6 +20,8 @@ struct AgentSession {
     let statusSince: Date?
     /// What a waiting session is blocked on, e.g. "dialog open".
     let waitingFor: String?
+    /// When the process registered, a second or so after it started.
+    var startedAt: Date?
     var subagents: Int = 0
     var contextTokens: Int?
     var cacheHit: Double?
@@ -83,7 +85,8 @@ func readAgentSessions() -> [AgentSession] {
             status: (root["status"] as? String) ?? "unknown",
             sessionId: (root["sessionId"] as? String) ?? "",
             statusSince: (root["statusUpdatedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) },
-            waitingFor: root["waitingFor"] as? String))
+            waitingFor: root["waitingFor"] as? String,
+            startedAt: (root["startedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }))
     }
     return out
 }

@@ -218,4 +218,65 @@ check("exited pin uses captured launch",
       pingLaunch(ex!, pin: exitedPin, live: []).map { $0.exe }, "/bin/true")
 check("no captured launch, no ping", pingLaunch(ex!, pin: Pin(sessionId: "x", pinnedAt: now), live: []) == nil, true)
 
+// Memory: session trees
+func proc(_ pid: pid_t, _ ppid: pid_t, _ name: String, mb: UInt64, path: String = "") -> Proc {
+    Proc(pid: pid, ppid: ppid, pgid: pid, name: name, started: 1, path: path, bytes: mb << 20)
+}
+/// Registered `registeredAt` seconds into 1970; the processes below started 1 µs into it.
+func live(_ pid: pid_t, _ label: String, registeredAt: TimeInterval? = 1) -> AgentSession {
+    var a = AgentSession(pid: pid, name: label, cwd: "", status: "busy", sessionId: label, statusSince: nil,
+                         waitingFor: nil, startedAt: registeredAt.map { Date(timeIntervalSince1970: $0) })
+    a.label = label
+    return a
+}
+let chromeHelper = "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer)"
+let conductorClaude = "/Users/u/Library/Application Support/com.conductor.app/agent-binaries/claude/2.1.284/claude"
+let webContent = "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"
+let procs = [
+    proc(100, 1, "claude", mb: 300),
+    proc(101, 100, "zsh", mb: 3),               // a Bash tool call
+    proc(102, 101, "python3.12", mb: 900),
+    proc(103, 102, "python3.12", mb: 200),
+    proc(104, 100, "node", mb: 80),             // an MCP server
+    proc(200, 1, "claude", mb: 250),            // a second session, nothing running
+    proc(300, 1, "Google Chrome", mb: 4000, path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+    proc(301, 300, "Google Chrome He", mb: 2000, path: chromeHelper),
+    proc(400, 1, "claude", mb: 150, path: conductorClaude),  // not a registered session
+    proc(500, 1, "com.apple.WebKit", mb: 700, path: webContent),
+]
+let mem = sessionMemory(procs, sessions: [live(100, "one"), live(200, "two"), live(999, "gone")])
+check("sessions whose process is gone are dropped", mem.map(\.pid), [100, 200])
+check("claude's own memory", mem[0].ownBytes >> 20, 300)
+check("one command per child, largest first", mem[0].commands.map(\.root.pid), [101, 104])
+check("a command holds everything under its root", mem[0].commands[0].procs.map(\.pid).sorted(), [101, 102, 103])
+check("a command is named after its largest process", mem[0].commands[0].name, "python3.12")
+check("session total", mem[0].bytes >> 20, 1483)
+check("an idle session has no commands", mem[1].commands.isEmpty, true)
+let nested = sessionMemory(procs + [proc(600, 102, "claude", mb: 400)], sessions: [live(100, "outer"), live(600, "inner")])
+check("a session started inside another is not counted in it", nested[0].bytes >> 20, 1483)
+check("it is counted as itself", nested[1].ownBytes >> 20, 400)
+// A process that started after the entry was written has a reused pid.
+check("a stale entry is not a session", sessionMemory(procs, sessions: [live(100, "stale", registeredAt: 0)]).isEmpty, true)
+check("nor is one without a start time", sessionMemory(procs, sessions: [live(100, "old", registeredAt: nil)]).isEmpty, true)
+check("a stale entry does not hide a command's process",
+      sessionMemory(procs, sessions: [live(100, "one"), live(102, "stale", registeredAt: 0)]).map { $0.bytes >> 20 }, [1483])
+
+// Memory: largest apps
+let apps = largestApps(procs, sessions: mem)
+check("helpers count toward their app", apps.first.map { "\($0.name) \($0.bytes >> 20)" }, "Google Chrome 6000")
+check("sessions count as Claude Code", apps.first { $0.name == "Claude Code" }.map { $0.bytes >> 20 }, 1733)
+check("a support folder named like a bundle is not an app", appName(procs[8]), "claude")
+check("web views count as WebKit", appName(procs[9]), "WebKit")
+check("no path falls back to the process name", appName(proc(1, 0, "launchd", mb: 1)), "launchd")
+check("only the largest are kept", largestApps(procs, sessions: mem, limit: 2).count, 2)
+check("bytes in GB", formatBytes(1_503_238_553), "1.4 GB")
+check("bytes in MB", formatBytes(900 << 20), "900 MB")
+check("badge only under pressure", [memoryBadge(.normal), memoryBadge(.warning), memoryBadge(.critical)], [nil, "mem", "mem"])
+
+// Memory: the real process table
+let me = readProcesses()?.first { $0.pid == getpid() }
+check("reads this process and its parent", me?.ppid, getppid())
+check("measures its footprint", (me?.bytes ?? 0) > 0, true)
+check("reads its executable path", me?.path.hasSuffix("/agenttest"), true)
+
 exit(failed ? 1 : 0)

@@ -123,6 +123,32 @@ ClaudeUsage --ping <pid> --dry-run   # the exact command a ping would run
 ClaudeUsage --ping <pid>             # one real ping; exit 2 if it missed the cache
 ```
 
+## Memory
+
+Every 10 seconds, and at once when the kernel changes the pressure level, one
+`sysctl` lists this user's processes and `proc_pid_rusage` reads each one's
+physical footprint: the number Activity Monitor shows as "Memory". A sample of
+about 420 processes took 6 ms, and the menu rebuild after it another 6 ms, so
+the two cost about 0.1% of one core.
+
+- **Pressure** is `kern.memorystatus_vm_pressure_level`, the kernel's own
+  verdict. Free memory misleads: it read 48% at warning while the compressor
+  held 6 GB. The menu bar shows `mem`, orange at warning and red at critical,
+  and nothing at normal.
+- **Sessions.** A session's tree starts at the `claude` pid in its registry
+  entry. An entry outlives a crash and its pid is soon reused, so the entry
+  counts only if that process started before the entry's `startedAt`. Each
+  direct child is a *command*: a Bash tool call (its shell and everything under
+  it), a background task, or an MCP server. A session started inside a command
+  is its own session, not part of the command. A command is named after its
+  largest process, since its root is usually a shell. A row shows its session's
+  memory from 1 GB (orange) and 4 GB (red); a claude process alone measured
+  160–350 MB.
+- **Largest apps.** Processes outside the sessions are summed per app by the
+  outermost `.app` bundle in their path, so Chrome's helpers count as Chrome.
+  Web views, Safari's and other apps', run in shared WebKit processes and show
+  as `WebKit`.
+
 ## Debugging
 
 macOS status items and their menus do not appear in `screencapture` output, so
@@ -132,5 +158,6 @@ the binary has a headless mode that prints exactly what the menu would show:
 ClaudeUsage --dump                 # what the menu bar shows
 ClaudeUsage --dump --cache-only    # exercise the offline fallback path
 ClaudeUsage --agents               # session rows as the dropdown shows them
-./test.sh                          # unit-test the reader, session model and pace forecast
+ClaudeUsage --memory               # memory readings behind the badge and rows
+./test.sh                          # unit-test the reader, session model, pace forecast and memory
 ```

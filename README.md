@@ -41,6 +41,10 @@ Full history: [CHANGELOG.md](CHANGELOG.md).
 - **Keep Cache Warm.** Pin a session and it is pinged shortly before the cache
   expires, so coming back to it costs cache-read prices, not a full rewrite.
   One avoided cold turn pays for about 20 pings.
+- **Memory.** `mem` in the menu bar while macOS reports memory pressure, orange
+  at warning and red at critical. The dropdown's Memory row shows swap and what
+  Claude Code sessions hold, with the largest apps in its submenu, and a session
+  holding 1 GB or more says so on its row.
 
 Works with any Claude Code session. If you use [Conductor](https://conductor.build),
 sessions are labelled with their chat titles and get an **Open in Conductor** action.
@@ -67,8 +71,9 @@ Keychain item — choose **Always Allow**. Enable **Open at Login** from the men
   and may change.
 - **Your token stays in the Keychain.** It is read fresh on each poll and never
   stored or sent anywhere else.
-- **Everything else is local file reads** of `~/.claude` (and Conductor's
-  database, read-only) and costs nothing against your rate limit.
+- **Everything else is local:** file reads of `~/.claude` (and Conductor's
+  database, read-only), and the process table for memory. None of it costs
+  anything against your rate limit.
 - **Keep Cache Warm spends tokens.** Each ping is a one-turn `claude -p` call at
   cache-read prices. Pins expire after 8 hours, pause when the 5-hour window
   reaches 90%, and every ping is logged with its cost to
@@ -80,6 +85,7 @@ Keychain item — choose **Always Allow**. Enable **Open at Login** from the men
 ClaudeUsage --dump                  # print what the menu bar shows
 ClaudeUsage --dump --cache-only     # exercise the offline fallback
 ClaudeUsage --agents                # session rows as the dropdown shows them
+ClaudeUsage --memory                # pressure, swap, and what each session's processes hold
 ClaudeUsage --ping <pid> --dry-run  # the exact command a keep-warm ping would run
 ./test.sh                           # unit tests
 ```

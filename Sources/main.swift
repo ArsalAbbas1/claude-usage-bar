@@ -179,6 +179,14 @@ func color(for pct: Double) -> NSColor {
     return .labelColor
 }
 
+func color(for pressure: MemoryPressure) -> NSColor {
+    switch pressure {
+    case .normal: return .labelColor
+    case .warning: return .systemOrange
+    case .critical: return .systemRed
+    }
+}
+
 /// Compact menu-bar label for a window: "5h", "7d", "7d·O".
 func shortLabel(_ key: String) -> String {
     switch key {
@@ -235,6 +243,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pinging = Set<String>()
     /// Last keep-warm outcome per session, shown in its submenu.
     var pinNotes: [String: String] = [:]
+    /// Latest memory reading; nil until the first sample lands.
+    var memory: MemorySnapshot?
+    /// A sample reads every process, so it stays off the main thread.
+    let memoryQueue = DispatchQueue(label: "claude-usage.memory", qos: .utility)
+    var memoryTimer: Timer?
+    /// Samples at once when the kernel changes the pressure level.
+    var pressureSource: DispatchSourceMemoryPressure?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Without this, a cmd-dragged position is forgotten on every relaunch.
@@ -273,6 +288,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         display.tolerance = 15
         displayTimer = display
+
+        let mem = Timer.scheduledTimer(withTimeInterval: memorySampleInterval, repeats: true) { [weak self] _ in
+            self?.sampleMemory()
+        }
+        mem.tolerance = 2
+        memoryTimer = mem
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
+        source.setEventHandler { [weak self] in self?.sampleMemory() }
+        source.resume()
+        pressureSource = source
+        sampleMemory()
     }
 
     static let barFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
@@ -364,6 +390,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func renderTitle() {
         guard let u = usage, u.binding != nil else { return }
         var segs = titleSegments(u).map { (text: $0.text, color: color(for: $0.pct)) }
+        if let m = memory, let badge = memoryBadge(m.pressure) {
+            segs.insert((text: badge, color: color(for: m.pressure)), at: 0)
+        }
         if let badge = waitingBadge(agents) {
             segs.insert((text: badge, color: .systemOrange), at: 0)
         }
@@ -481,6 +510,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
 
+        if let m = memory {
+            menu.addItem(memoryItem(m, font: mono))
+        }
         if let err = lastError {
             menu.addItem(disabled("⚠ \(err)"))
         }
@@ -528,6 +560,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The title is redrawn only when the pressure level changes: setting it
+    /// costs ~13 ms, as measured for the spinner.
+    func sampleMemory() {
+        let sessions = agents.sessions
+        memoryQueue.async { [weak self] in
+            guard let snap = takeMemorySnapshot(sessions: sessions) else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let levelChanged = self.memory?.pressure != snap.pressure
+                self.memory = snap
+                if levelChanged { self.renderTitle() }
+                self.rebuildMenu()
+            }
+        }
+    }
+
     /// A session blocked on a dialog makes no progress until you answer it, and
     /// nothing on screen says so when its window is not in front.
     func notifyWaits(_ snapshot: AgentSnapshot) {
@@ -553,7 +601,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func sessionItem(_ a: AgentSession, font: NSFont, now: Date) -> NSMenuItem {
         let mi = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        mi.attributedTitle = sessionRow(a, font: font, now: now, pin: pins.pins[a.sessionId])
+        mi.attributedTitle = sessionRow(a, font: font, now: now, pin: pins.pins[a.sessionId],
+                                        memory: memory?.session(a.pid)?.bytes)
 
         let sub = NSMenu()
         let toggle = NSMenuItem(title: "Keep Cache Warm", action: #selector(togglePin(_:)), keyEquivalent: "")
@@ -562,6 +611,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggle.state = pins.isPinned(a.sessionId) ? .on : .off
         sub.addItem(toggle)
         if let note = pinNotes[a.sessionId] { sub.addItem(disabled(note)) }
+        if let s = memory?.session(a.pid) {
+            let largest = s.commands.first.map { " · largest \($0.name) \(formatBytes($0.bytes))" } ?? ""
+            sub.addItem(disabled("Memory \(formatBytes(s.bytes))\(largest)"))
+        }
         if a.fromConductor {
             sub.addItem(.separator())
             let open = NSMenuItem(title: "Open in Conductor", action: #selector(openConductor), keyEquivalent: "")
@@ -656,6 +709,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return mi
     }
 
+    /// Pressure, swap and what Claude Code holds. The submenu names the largest
+    /// apps, because the pressure is often not Claude's.
+    func memoryItem(_ m: MemorySnapshot, font: NSFont) -> NSMenuItem {
+        let line = "\(pad("Memory", 12)) \(m.pressure) · swap \(formatBytes(m.swapBytes))"
+            + " · Claude \(formatBytes(m.claudeBytes))"
+        let mi = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        mi.attributedTitle = NSAttributedString(string: line, attributes: [
+            .font: font, .foregroundColor: color(for: m.pressure),
+        ])
+        let sub = NSMenu()
+        sub.addItem(disabled("LARGEST APPS"))
+        for app in m.apps {
+            let row = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            row.attributedTitle = NSAttributedString(
+                string: "\(pad(truncate(app.name, 24), 24)) \(formatBytes(app.bytes))",
+                attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+            sub.addItem(row)
+        }
+        mi.submenu = sub
+        return mi
+    }
+
     @objc func openConductor() {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.conductor.app").first {
             app.activate()
@@ -683,10 +758,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 /// One session row: status dot, label, how long it has been in that state, and
-/// only the warnings that ask for action (big context, silence, what it waits on).
-/// Shape carries the status as well as colour, so rows stay readable without
-/// relying on colour alone.
-func sessionRow(_ a: AgentSession, font: NSFont, now: Date, pin: Pin? = nil) -> NSAttributedString {
+/// only the warnings that ask for action (big context, big memory, silence, what
+/// it waits on). Shape carries the status as well as colour, so rows stay
+/// readable without relying on colour alone.
+func sessionRow(_ a: AgentSession, font: NSFont, now: Date, pin: Pin? = nil, memory: UInt64? = nil) -> NSAttributedString {
     let (dot, tint): (String, NSColor) = {
         switch a.status {
         case "busy":    return ("\u{25CF}", .systemGreen)
@@ -726,6 +801,9 @@ func sessionRow(_ a: AgentSession, font: NSFont, now: Date, pin: Pin? = nil) -> 
         add(pad(formatTokens(tokens) + " ctx", 11), tokens >= contextAlertTokens ? .systemRed : .systemOrange)
     } else {
         add(pad("", 11), base)
+    }
+    if let bytes = memory, bytes >= memoryWarnBytes {
+        add("\(formatBytes(bytes)) mem  ", bytes >= memoryAlertBytes ? .systemRed : .systemOrange)
     }
     if a.subagents > 0 { add("+\(a.subagents) agents  ", base) }
     if let quiet = a.silence(at: now) { add("\u{26A0} silent \(formatDuration(quiet))", .systemOrange) }
@@ -770,12 +848,31 @@ if CommandLine.arguments.contains("--agents") {
         print("No Claude Code sessions running")
     } else {
         let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let memory = takeMemorySnapshot(sessions: snap.sessions)
         for a in snap.waiting + snap.busy + snap.idle {
-            print(pad(String(a.pid), 7) + sessionRow(a, font: font, now: Date(), pin: pins.pins[a.sessionId]).string)
+            print(pad(String(a.pid), 7) + sessionRow(a, font: font, now: Date(), pin: pins.pins[a.sessionId],
+                                                     memory: memory?.session(a.pid)?.bytes).string)
         }
         print("---")
         print("waiting=\(snap.waiting.count) busy=\(snap.busyCount) idle=\(snap.idle.count) subagents=\(snap.subagentCount)")
     }
+    exit(0)
+}
+
+// `ClaudeUsage --memory` prints the memory readings behind the badge, the Memory
+// row and the session rows.
+if CommandLine.arguments.contains("--memory") {
+    guard let m = takeMemorySnapshot(sessions: SessionScanner().snapshot().sessions) else {
+        print("could not read the process table"); exit(1)
+    }
+    print("pressure \(m.pressure) · swap \(formatBytes(m.swapBytes)) · Claude \(formatBytes(m.claudeBytes))")
+    for s in m.sessions.sorted(by: { $0.bytes > $1.bytes }) {
+        print("  \(pad(String(s.pid), 7))\(pad(s.label, 36)) \(formatBytes(s.bytes))  (claude \(formatBytes(s.ownBytes)))")
+        for c in s.commands.prefix(3) {
+            print("    \(pad(String(c.root.pid), 7))\(pad(c.name, 20)) \(formatBytes(c.bytes))  \(c.procs.count) processes")
+        }
+    }
+    print("largest apps: " + m.apps.map { "\($0.name) \(formatBytes($0.bytes))" }.joined(separator: ", "))
     exit(0)
 }
 
@@ -824,6 +921,7 @@ if CommandLine.arguments.contains("--dump") {
     guard let u = result else { print("no usage available"); exit(1) }
     var barText = titleText(u)
     let snap = SessionScanner().snapshot()
+    if let badge = memoryBadge(.current()) { barText = badge + "  " + barText }
     if let badge = waitingBadge(snap) { barText = badge + "  " + barText }
     if let suffix = agentSuffix(snap) { barText += "  " + suffix }
     print("menu bar: \(barText)")
