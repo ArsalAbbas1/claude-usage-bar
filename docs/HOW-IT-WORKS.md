@@ -136,18 +136,64 @@ the two cost about 0.1% of one core.
   held 6 GB. The menu bar shows `mem`, orange at warning and red at critical,
   and nothing at normal.
 - **Sessions.** A session's tree starts at the `claude` pid in its registry
-  entry. An entry outlives a crash and its pid is soon reused, so the entry
-  counts only if that process started before the entry's `startedAt`. Each
-  direct child is a *command*: a Bash tool call (its shell and everything under
-  it), a background task, or an MCP server. A session started inside a command
-  is its own session, not part of the command. A command is named after its
-  largest process, since its root is usually a shell. A row shows its session's
-  memory from 1 GB (orange) and 4 GB (red); a claude process alone measured
-  160–350 MB.
+  entry, which is re-read for every sample. An entry outlives a crash and its
+  pid is soon reused, so the entry counts only if that process started before
+  the entry's `startedAt`. Each direct child is a *command*: a Bash tool call
+  (its shell and everything under it), a background task, or an MCP server. A
+  session started inside a command is its own session, not part of the
+  command. A command is named after its largest process, since its root is
+  usually a shell. A row shows its session's memory from 1 GB (orange) and 4 GB
+  (red); a claude process alone measured 160–350 MB.
 - **Largest apps.** Processes outside the sessions are summed per app by the
   outermost `.app` bundle in their path, so Chrome's helpers count as Chrome.
   Web views, Safari's and other apps', run in shared WebKit processes and show
   as `WebKit`.
+
+### Caps
+
+All are off by default. They are set from the Memory row's submenu and saved
+under `memory` in `~/.config/claude-usage-bar/config.json`, where a cap edited
+by hand counts only from 0.5 to 512 GB.
+
+| Setting | Choices | What it stops |
+|---|---|---|
+| **Command cap** | off, 2, 3, 4 GB | a command that passes the cap |
+| **Session cap** | off, 4, 6, 8 GB | the session's largest command, once all its commands together pass the cap |
+| **At critical** | notify, or notify and stop | the largest command of any session, if it holds at least 1 GB |
+
+A command counts everything under it, so one that keeps forking is caught even
+though each of its processes is small. A session's claude process is never
+stopped and never counts toward a cap: stopping commands could not bring it down.
+
+Stopping a command notifies you, sends `SIGTERM`, and sends `SIGKILL` 10 seconds
+later to whatever is still running. A Bash tool call's shell leads its own
+process group, so the signal goes to the whole group, which also reaches
+processes forked since the last sample. Two kinds of command are signalled one
+sampled process at a time instead:
+
+- **MCP servers**, which share their session's group. A process a server
+  forked since the last sample is missed, and if the server exits first, that
+  process leaves the session's tree.
+- **A command with a session inside it**, such as `claude -p` run from a Bash
+  tool call. That session shares the command's group, and it and its MCP
+  servers are left running.
+
+A sampled process is signalled on its own only if its start time still
+matches, so a reused pid is never hit. A session's claude process is never
+signalled once it has registered, a few seconds after it starts; the registry
+is read fresh for each signal. Every stop and every change of cap is logged to
+`~/.config/claude-usage-bar/memory.log`.
+
+At critical pressure the app notifies at most once every 15 minutes, naming the
+largest apps; clicking the notification opens Activity Monitor. **Notify and
+stop** also stops the largest command, but only one of at least 1 GB: the
+pressure is usually another app's, and a small command frees too little to
+help. Within 20 seconds of any stop it only notifies, since the memory that
+stop frees may not be back yet.
+
+macOS gives an ordinary app no hard memory limit on another process, so a cap
+acts at the next sample, up to 12 seconds after it is crossed: the timer may
+fire 2 seconds late so macOS can batch it with other wakeups.
 
 ## Debugging
 
@@ -159,5 +205,6 @@ ClaudeUsage --dump                 # what the menu bar shows
 ClaudeUsage --dump --cache-only    # exercise the offline fallback path
 ClaudeUsage --agents               # session rows as the dropdown shows them
 ClaudeUsage --memory               # memory readings behind the badge and rows
+ClaudeUsage --memory --command-cap 1   # what a 1 GB command cap would stop, without stopping it
 ./test.sh                          # unit-test the reader, session model, pace forecast and memory
 ```

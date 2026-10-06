@@ -250,6 +250,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var memoryTimer: Timer?
     /// Samples at once when the kernel changes the pressure level.
     var pressureSource: DispatchSourceMemoryPressure?
+    var memoryCaps = loadMemoryCaps()
+    /// Roots of commands being stopped, until a sample no longer finds them.
+    var stopping = Set<pid_t>()
+    var lastStop: Date?
+    var lastCriticalAction: Date?
+    static let criticalNotification = "memory.critical"
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Without this, a cmd-dragged position is forgotten on every relaunch.
@@ -293,6 +299,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.sampleMemory()
         }
         mem.tolerance = 2
+        // Caps keep acting while the menu is open, which the default mode pauses.
+        RunLoop.main.add(mem, forMode: .common)
         memoryTimer = mem
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: .main)
         source.setEventHandler { [weak self] in self?.sampleMemory() }
@@ -561,19 +569,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The title is redrawn only when the pressure level changes: setting it
-    /// costs ~13 ms, as measured for the spinner.
+    /// costs ~13 ms, as measured for the spinner. The registry is read fresh,
+    /// not taken from the last scan, which can be a minute old, so a session
+    /// started inside a command is never counted in it.
     func sampleMemory() {
-        let sessions = agents.sessions
+        let labels = Dictionary(agents.sessions.map { ($0.pid, $0.label) }, uniquingKeysWith: { a, _ in a })
         memoryQueue.async { [weak self] in
+            let sessions = readAgentSessions().map { a in
+                var a = a
+                a.label = labels[a.pid] ?? a.name
+                return a
+            }
             guard let snap = takeMemorySnapshot(sessions: sessions) else { return }
             DispatchQueue.main.async {
                 guard let self else { return }
                 let levelChanged = self.memory?.pressure != snap.pressure
                 self.memory = snap
+                self.enforceMemory(snap)
                 if levelChanged { self.renderTitle() }
                 self.rebuildMenu()
             }
         }
+    }
+
+    func enforceMemory(_ m: MemorySnapshot) {
+        // A command still exiting after its SIGKILL is not stopped twice.
+        stopping.formIntersection(m.sessions.flatMap { $0.commands.map(\.root.pid) })
+        let now = Date()
+        for action in memoryActions(m, caps: memoryCaps, stopping: stopping, lastStop: lastStop,
+                                    lastCritical: lastCriticalAction, now: now) {
+            switch action {
+            case .stop(let c, let session, let reason):
+                if reason == .critical { lastCriticalAction = now }
+                stop(c, session: session, reason: reason)
+            case .warnCritical:
+                lastCriticalAction = now
+                let largest = m.apps.prefix(3).map { "\($0.name) \(formatBytes($0.bytes))" }.joined(separator: " · ")
+                notify(id: Self.criticalNotification, title: "Memory pressure is critical", body: "Largest: \(largest)")
+                logMemory("critical: notified, largest \(largest)")
+            }
+        }
+    }
+
+    /// Notifies first, so a command never vanishes unexplained; SIGKILL follows
+    /// `stopGrace` later for whatever is still running.
+    func stop(_ c: MemoryCommand, session: String, reason: StopReason) {
+        stopping.insert(c.root.pid)
+        lastStop = Date()
+        notify(id: "memory.stop.\(c.root.pid)", title: "Stopping \(c.name) in \(session)",
+               body: "\(formatBytes(c.bytes)): \(reason)")
+        _ = deliver(SIGTERM, to: c, protected: sessionPids())
+        logMemory("\(session): SIGTERM \(c.name) pid \(c.root.pid), \(formatBytes(c.bytes)) in \(c.procs.count) processes: \(reason)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + stopGrace) {
+            if deliver(SIGKILL, to: c, protected: sessionPids()) > 0 {
+                logMemory("\(session): SIGKILL \(c.name) pid \(c.root.pid): still running after \(Int(stopGrace))s")
+            }
+        }
+    }
+
+    func notify(id: String, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
     }
 
     /// A session blocked on a dialog makes no progress until you answer it, and
@@ -588,12 +646,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard now.timeIntervalSince(since) >= waitingNotifyAfter,
                   !notifiedWaits.contains(key) else { continue }
             notifiedWaits.insert(key)
-            let content = UNMutableNotificationContent()
-            content.title = "\(a.label) needs you"
-            content.body = "Waiting \(formatDuration(now.timeIntervalSince(since)))"
-                + (a.waitingFor.map { " — \($0)" } ?? "")
-            UNUserNotificationCenter.current().add(
-                UNNotificationRequest(identifier: key, content: content, trigger: nil))
+            notify(id: key, title: "\(a.label) needs you",
+                   body: "Waiting \(formatDuration(now.timeIntervalSince(since)))" + (a.waitingFor.map { " — \($0)" } ?? ""))
         }
         // Forget waits that ended, so the set does not grow without bound.
         notifiedWaits.formIntersection(current)
@@ -727,8 +781,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 attributes: [.font: font, .foregroundColor: NSColor.labelColor])
             sub.addItem(row)
         }
+        sub.addItem(.separator())
+        // A cap's choices are tagged with their size in GB, and 0 is off. A cap
+        // set by hand to another size checks none of them.
+        func caps(_ gbs: [Int]) -> [(tag: Int, title: String)] { [(0, "Off")] + gbs.map { ($0, "\($0) GB") } }
+        func tag(_ gb: Double?) -> Int { gb.map { Int(exactly: $0) ?? -1 } ?? 0 }
+        sub.addItem(choiceItem("Command cap: \(memoryCaps.commandGB.map(formatGB) ?? "off")",
+                               hint: "Stop a command a session started once it passes",
+                               choices: caps(commandCapChoices), selected: tag(memoryCaps.commandGB),
+                               action: #selector(setCommandCap(_:))))
+        sub.addItem(choiceItem("Session cap: \(memoryCaps.sessionGB.map(formatGB) ?? "off")",
+                               hint: "Stop a session's largest command once all its commands pass",
+                               choices: caps(sessionCapChoices), selected: tag(memoryCaps.sessionGB),
+                               action: #selector(setSessionCap(_:))))
+        sub.addItem(choiceItem("At critical: \(memoryCaps.stopAtCritical ? "notify and stop" : "notify")",
+                               hint: "When macOS reports critical memory pressure",
+                               choices: [(0, "Notify"), (1, "Notify and stop the largest command")],
+                               selected: memoryCaps.stopAtCritical ? 1 : 0, action: #selector(setCriticalAction(_:))))
         mi.submenu = sub
         return mi
+    }
+
+    /// A setting: its submenu holds a hint, then a choice per tag.
+    func choiceItem(_ title: String, hint: String, choices: [(tag: Int, title: String)], selected: Int,
+                    action: Selector) -> NSMenuItem {
+        let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.addItem(disabled(hint))
+        for c in choices {
+            let o = NSMenuItem(title: c.title, action: action, keyEquivalent: "")
+            o.target = self
+            o.tag = c.tag
+            o.state = c.tag == selected ? .on : .off
+            sub.addItem(o)
+        }
+        mi.submenu = sub
+        return mi
+    }
+
+    @objc func setCommandCap(_ sender: NSMenuItem) {
+        memoryCaps.commandGB = sender.tag > 0 ? Double(sender.tag) : nil
+        capsChanged()
+    }
+
+    @objc func setSessionCap(_ sender: NSMenuItem) {
+        memoryCaps.sessionGB = sender.tag > 0 ? Double(sender.tag) : nil
+        capsChanged()
+    }
+
+    @objc func setCriticalAction(_ sender: NSMenuItem) {
+        memoryCaps.stopAtCritical = sender.tag == 1
+        capsChanged()
+    }
+
+    func capsChanged() {
+        let saved = saveMemoryCaps(memoryCaps)
+        logMemory("caps: \(memoryCaps.summary)" + (saved ? "" : ", not saved: config.json did not parse or could not be written"))
+        rebuildMenu()
+    }
+
+    /// The critical alert is about the whole Mac, not a session.
+    func openActivityMonitor() {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.ActivityMonitor") {
+            NSWorkspace.shared.openApplication(at: url, configuration: .init())
+        }
     }
 
     @objc func openConductor() {
@@ -823,7 +939,11 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler done: @escaping () -> Void) {
-        openConductor()
+        if response.notification.request.identifier == AppDelegate.criticalNotification {
+            openActivityMonitor()
+        } else {
+            openConductor()
+        }
         done()
     }
 }
@@ -859,9 +979,18 @@ if CommandLine.arguments.contains("--agents") {
     exit(0)
 }
 
-// `ClaudeUsage --memory` prints the memory readings behind the badge, the Memory
-// row and the session rows.
+// `ClaudeUsage --memory [--command-cap GB] [--session-cap GB] [--stop-at-critical]`
+// prints the memory readings behind the badge, the Memory row and the session
+// rows, and what the saved caps, or the ones given, would stop. It never stops anything.
 if CommandLine.arguments.contains("--memory") {
+    let args = CommandLine.arguments
+    func gb(after flag: String) -> Double? {
+        args.firstIndex(of: flag).flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil }
+    }
+    var caps = loadMemoryCaps()
+    if let v = gb(after: "--command-cap") { caps.commandGB = validCap(v) }
+    if let v = gb(after: "--session-cap") { caps.sessionGB = validCap(v) }
+    if args.contains("--stop-at-critical") { caps.stopAtCritical = true }
     guard let m = takeMemorySnapshot(sessions: SessionScanner().snapshot().sessions) else {
         print("could not read the process table"); exit(1)
     }
@@ -873,6 +1002,15 @@ if CommandLine.arguments.contains("--memory") {
         }
     }
     print("largest apps: " + m.apps.map { "\($0.name) \(formatBytes($0.bytes))" }.joined(separator: ", "))
+    print(caps.summary)
+    for action in memoryActions(m, caps: caps, stopping: [], lastStop: nil, lastCritical: nil, now: Date()) {
+        switch action {
+        case .stop(let c, let session, let reason):
+            print("would stop \(c.name) pid \(c.root.pid), \(formatBytes(c.bytes)) in \(c.procs.count) processes, in \(session): \(reason)")
+        case .warnCritical:
+            print("would notify: memory pressure is critical")
+        }
+    }
     exit(0)
 }
 

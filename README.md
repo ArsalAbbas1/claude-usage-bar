@@ -45,6 +45,10 @@ Full history: [CHANGELOG.md](CHANGELOG.md).
   at warning and red at critical. The dropdown's Memory row shows swap and what
   Claude Code sessions hold, with the largest apps in its submenu, and a session
   holding 1 GB or more says so on its row.
+- **Memory caps, off by default.** Stop a command a session started once it
+  passes 2–4 GB, or a session's largest command once all its commands pass
+  4–8 GB. At critical pressure you are notified with the largest apps, or the
+  largest command can be stopped as well.
 
 Works with any Claude Code session. If you use [Conductor](https://conductor.build),
 sessions are labelled with their chat titles and get an **Open in Conductor** action.
@@ -78,6 +82,10 @@ Keychain item — choose **Always Allow**. Enable **Open at Login** from the men
   cache-read prices. Pins expire after 8 hours, pause when the 5-hour window
   reaches 90%, and every ping is logged with its cost to
   `~/.config/claude-usage-bar/keepwarm.log`.
+- **Memory caps stop processes, once you turn one on.** A stopped command gets
+  `SIGTERM`, then `SIGKILL` 10 seconds later. Only processes a Claude Code
+  session started are stopped, never a session's `claude` process, and every
+  stop is logged to `~/.config/claude-usage-bar/memory.log`.
 
 ## Command line
 
@@ -86,6 +94,7 @@ ClaudeUsage --dump                  # print what the menu bar shows
 ClaudeUsage --dump --cache-only     # exercise the offline fallback
 ClaudeUsage --agents                # session rows as the dropdown shows them
 ClaudeUsage --memory                # pressure, swap, and what each session's processes hold
+ClaudeUsage --memory --command-cap 1  # what a 1 GB command cap would stop, without stopping it
 ClaudeUsage --ping <pid> --dry-run  # the exact command a keep-warm ping would run
 ./test.sh                           # unit tests
 ```

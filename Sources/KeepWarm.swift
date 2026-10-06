@@ -14,7 +14,7 @@ let pingMinCacheRead = 0.9
 let pingTimeout: TimeInterval = 120
 let pingPrompt = "Keep-warm ping from Claude Usage. Do not use any tools. Reply with exactly: ok"
 
-private let configDir = NSHomeDirectory() + "/.config/claude-usage-bar"
+let configDir = NSHomeDirectory() + "/.config/claude-usage-bar"
 
 struct Pin: Codable, Equatable {
     let sessionId: String
@@ -299,7 +299,12 @@ func logPing(_ label: String, sessionId: String, _ result: Result<PingResult, Pi
     case .failure(let e):
         line = "\(ts) \(sessionId.prefix(8)) \(label): FAILED \(e)\n"
     }
-    let path = configDir + "/keepwarm.log"
+    appendLog(line, to: "keepwarm.log")
+}
+
+/// Appends to a log in the config directory.
+func appendLog(_ line: String, to name: String) {
+    let path = configDir + "/" + name
     try? FileManager.default.createDirectory(atPath: configDir, withIntermediateDirectories: true)
     if let h = FileHandle(forWritingAtPath: path) {
         h.seekToEndOfFile()

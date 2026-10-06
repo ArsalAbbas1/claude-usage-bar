@@ -279,4 +279,165 @@ check("reads this process and its parent", me?.ppid, getppid())
 check("measures its footprint", (me?.bytes ?? 0) > 0, true)
 check("reads its executable path", me?.path.hasSuffix("/agenttest"), true)
 
+// Memory caps
+func snapshot(_ sessions: [SessionMemory], _ pressure: MemoryPressure = .normal) -> MemorySnapshot {
+    MemorySnapshot(pressure: pressure, swapBytes: 0, sessions: sessions, apps: [])
+}
+/// `processes` processes sharing `mb`, the first one the root.
+func command(_ pid: pid_t, mb: UInt64, processes: Int = 1) -> MemoryCommand {
+    MemoryCommand(procs: (0..<processes).map {
+        proc(pid + pid_t($0), $0 == 0 ? 1 : pid, "python3.12", mb: mb / UInt64(processes))
+    })
+}
+func sessionWith(_ pid: pid_t, own mb: UInt64 = 300, _ commands: [MemoryCommand]) -> SessionMemory {
+    SessionMemory(pid: pid, label: "s\(pid)", ownBytes: mb << 20, commands: commands.sorted { $0.bytes > $1.bytes })
+}
+func actions(_ m: MemorySnapshot, _ caps: MemoryCaps, stopping: Set<pid_t> = [], lastStop: Date? = nil,
+             lastCritical: Date? = nil) -> [String] {
+    memoryActions(m, caps: caps, stopping: stopping, lastStop: lastStop, lastCritical: lastCritical, now: now).map {
+        if case .stop(let c, _, let reason) = $0 { return "stop \(c.root.pid): \(reason)" }
+        return "notify"
+    }
+}
+let heavy = sessionWith(100, [command(110, mb: 3500), command(120, mb: 2900)])
+let several = sessionWith(400, [command(410, mb: 2100), command(420, mb: 2000), command(430, mb: 1000)])
+check("caps are off by default", loadMemoryCaps(path: "/tmp/no-such-config.json"), MemoryCaps())
+check("nothing is stopped with caps off", actions(snapshot([heavy]), MemoryCaps()), [])
+check("a command over the cap is stopped", actions(snapshot([heavy]), MemoryCaps(commandGB: 3)),
+      ["stop 110: over the 3 GB command cap"])
+check("a fork bomb is one command", actions(snapshot([sessionWith(300, [command(310, mb: 11_000, processes: 80)])]),
+                                            MemoryCaps(commandGB: 3)),
+      ["stop 310: over the 3 GB command cap"])
+check("the claude process is never a target",
+      actions(snapshot([sessionWith(200, own: 10_000, [command(210, mb: 50)])]), MemoryCaps(commandGB: 2, sessionGB: 4)), [])
+check("a session over its cap loses its largest command", actions(snapshot([several]), MemoryCaps(sessionGB: 4)),
+      ["stop 410: its session's commands passed the 4 GB session cap"])
+check("a command being stopped is not stopped again", actions(snapshot([heavy]), MemoryCaps(commandGB: 3), stopping: [110]), [])
+check("nor counted toward its session's cap", actions(snapshot([several]), MemoryCaps(sessionGB: 4), stopping: [410]), [])
+check("a custom cap reads as given", MemoryCaps(commandGB: 0.15).summary.hasPrefix("command cap 0.15 GB"), true)
+
+let critical = snapshot([heavy], .critical)
+let stopAtCritical = MemoryCaps(stopAtCritical: true)
+check("critical notifies by default", actions(critical, MemoryCaps()), ["notify"])
+check("once per cooldown", actions(critical, MemoryCaps(), lastCritical: now.addingTimeInterval(-60)), [])
+check("and again after it", actions(critical, MemoryCaps(), lastCritical: now.addingTimeInterval(-criticalCooldown)), ["notify"])
+check("critical can stop the largest command", actions(critical, stopAtCritical), ["stop 110: memory pressure is critical"])
+check("a command too small to help is left alone",
+      actions(snapshot([sessionWith(500, [command(510, mb: 600)])], .critical), stopAtCritical), ["notify"])
+check("a cap stop is not followed by a critical one in the same sample",
+      actions(critical, MemoryCaps(commandGB: 3, stopAtCritical: true)), ["stop 110: over the 3 GB command cap", "notify"])
+check("nor while an earlier stop may still be freeing memory",
+      actions(critical, stopAtCritical, lastStop: now.addingTimeInterval(-4)), ["notify"])
+check("but after it has had time to", actions(critical, stopAtCritical, lastStop: now.addingTimeInterval(-20)),
+      ["stop 110: memory pressure is critical"])
+check("warning stops nothing", actions(snapshot([heavy], .warning), stopAtCritical), [])
+check("a cap outside 0.5–512 GB is off", [0, -1, 0.4, 1e12, Double.nan, Double.infinity, 0.5, 512].map { validCap($0) },
+      [nil, nil, nil, nil, nil, nil, 0.5, 512])
+
+let configFixture = "/tmp/agent-fixture-config.json"
+try? #"{"theme":"htop"}"#.write(toFile: configFixture, atomically: true, encoding: .utf8)
+saveMemoryCaps(MemoryCaps(commandGB: 3, stopAtCritical: true), path: configFixture)
+check("caps persist", loadMemoryCaps(path: configFixture), MemoryCaps(commandGB: 3, stopAtCritical: true))
+let savedRoot = FileManager.default.contents(atPath: configFixture)
+    .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+check("other settings in the file are kept", savedRoot?["theme"] as? String, "htop")
+saveMemoryCaps(MemoryCaps(), path: configFixture)
+check("a cap turned off stays off", loadMemoryCaps(path: configFixture), MemoryCaps())
+try? #"{"memory":{"commandCapGB":0,"sessionCapGB":1e12,"atCritical":"notify"}}"#
+    .write(toFile: configFixture, atomically: true, encoding: .utf8)
+check("a cap edited out of range loads as off", loadMemoryCaps(path: configFixture), MemoryCaps())
+let handEdit = #"{"theme":"htop""#
+try? handEdit.write(toFile: configFixture, atomically: true, encoding: .utf8)
+check("a file that does not parse is not saved over", saveMemoryCaps(MemoryCaps(commandGB: 3), path: configFixture), false)
+check("and is left as it was", try? String(contentsOfFile: configFixture, encoding: .utf8), handEdit)
+
+// Memory caps: stopping real processes, all spawned here in their own group
+func spawnGroup(_ script: String) -> pid_t {
+    var attr: posix_spawnattr_t?
+    posix_spawnattr_init(&attr)
+    posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP))
+    posix_spawnattr_setpgroup(&attr, 0)
+    var pid: pid_t = 0
+    let words: [String] = ["/bin/sh", "-c", script]
+    let argv: [UnsafeMutablePointer<CChar>?] = words.map { strdup($0) } + [nil]
+    let rc = posix_spawn(&pid, "/bin/sh", nil, &attr, argv, nil)
+    posix_spawnattr_destroy(&attr)
+    argv.forEach { free($0) }
+    // 0 is "my own group" to waitpid and killpg, so a failed spawn must not leave it.
+    return rc == 0 ? pid : -1
+}
+/// The process and its children once it has started `children` of them.
+func sampleGroup(_ pid: pid_t, children: Int) -> (root: Proc, children: [pid_t])? {
+    for _ in 0..<40 where pid > 0 {
+        let table = readProcesses() ?? []
+        let kids = table.filter { $0.ppid == pid }.map(\.pid)
+        if let root = table.first(where: { $0.pid == pid }), kids.count >= children { return (root, kids) }
+        usleep(50_000)
+    }
+    return nil
+}
+/// The signal that ended `pid`, or nil if it is still running after `secs`.
+func endedBy(_ pid: pid_t, within secs: Double) -> Int32? {
+    var status: Int32 = 0
+    for _ in 0..<max(1, Int(secs * 20)) {
+        if waitpid(pid, &status, WNOHANG) == pid { return status & 0x7f }
+        usleep(50_000)
+    }
+    return nil
+}
+func gone(_ pid: pid_t) -> Bool {
+    for _ in 0..<40 where kill(pid, 0) == 0 { usleep(50_000) }
+    return kill(pid, 0) != 0
+}
+
+let group = spawnGroup("/bin/sleep 30 & /bin/sleep 30 & wait")
+if let g = sampleGroup(group, children: 2) {
+    check("the spawned shell leads its own group", g.root.pgid, group)
+    // Only the root is sampled: the group is what reaches its children.
+    check("SIGTERM is delivered", deliver(SIGTERM, to: MemoryCommand(procs: [g.root]), protected: []) > 0, true)
+    check("the shell ends on SIGTERM", endedBy(group, within: 3), SIGTERM)
+    check("so do its children, which were not sampled", g.children.allSatisfy(gone), true)
+} else { check("group started", false, true) }
+
+// The trailing `:` keeps sh from exec'ing sleep, so a child means the trap is set.
+let stubborn = spawnGroup("trap '' TERM; /bin/sleep 30; :")
+if let s = sampleGroup(stubborn, children: 1) {
+    let cmd = MemoryCommand(procs: [s.root])
+    _ = deliver(SIGTERM, to: cmd, protected: [])
+    check("a command can ignore SIGTERM", endedBy(stubborn, within: 1), nil)
+    check("SIGKILL reaches it", deliver(SIGKILL, to: cmd, protected: []) > 0, true)
+    check("and ends it", endedBy(stubborn, within: 3), SIGKILL)
+} else { check("stubborn command started", false, true) }
+
+let decoy = spawnGroup("/bin/sleep 30")
+if let d = sampleGroup(decoy, children: 0), let me {
+    let reused = Proc(pid: decoy, ppid: d.root.ppid, pgid: d.root.pgid, name: "sleep", started: d.root.started + 1)
+    check("a reused pid is left alone", deliver(SIGTERM, to: MemoryCommand(procs: [reused]), protected: []), 0)
+    check("a protected pid is left alone", deliver(SIGTERM, to: MemoryCommand(procs: [d.root]), protected: [decoy]), 0)
+    check("this app is left alone", deliver(SIGTERM, to: MemoryCommand(procs: [me]), protected: []), 0)
+    check("the decoy is still running", endedBy(decoy, within: 0.2), nil)
+} else { check("decoy started", false, true) }
+
+// Protected pids come from the registry, where an entry can outlive its process.
+let myStart = Double(me?.started ?? 0) / 1_000_000
+check("a session's process is protected", sessionPids([live(getpid(), "me", registeredAt: myStart + 1)]), [getpid()])
+check("so is one whose entry has no start time", sessionPids([live(getpid(), "old", registeredAt: nil)]), [getpid()])
+check("a stale entry's pid is not", sessionPids([live(getpid(), "stale", registeredAt: myStart - 1)]), [])
+
+// A session started inside a command shares the command's group.
+let shared = spawnGroup("/bin/sleep 30 & /bin/sleep 30 & wait")
+if let g = sampleGroup(shared, children: 2) {
+    let cmd = MemoryCommand(procs: [g.root])
+    _ = deliver(SIGTERM, to: cmd, protected: [g.children[0]])
+    check("a group holding a protected pid is signalled one process at a time", endedBy(shared, within: 3), SIGTERM)
+    check("so the protected pid and its group are left running", g.children.allSatisfy { kill($0, 0) == 0 }, true)
+    check("once the root is gone, its group's leftovers are reached", deliver(SIGKILL, to: cmd, protected: []) > 0, true)
+    check("and end", g.children.allSatisfy(gone), true)
+} else { check("shared group started", false, true) }
+// Only a child still running is ours to kill: a reaped one's pid may be reused.
+for pid in [group, stubborn, decoy, shared] where pid > 0 && waitpid(pid, nil, WNOHANG) == 0 {
+    killpg(pid, SIGKILL)
+    _ = endedBy(pid, within: 1)
+}
+
 exit(failed ? 1 : 0)
